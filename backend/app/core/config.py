@@ -8,8 +8,8 @@ from pydantic import parse_obj_as
 
 class Settings(BaseSettings):
     API_V1_STR: str = "/api/v1"
-    JWT_SECRET_KEY: str = config("JWT_SECRET_KEY", cast=str)
-    JWT_REFRESH_SECRET_KEY: str = config("JWT_REFRESH_SECRET_KEY", cast=str)
+    JWT_SECRET_KEY: str = config("JWT_SECRET_KEY", default="my-secret", cast=str)
+    JWT_REFRESH_SECRET_KEY: str = config("JWT_REFRESH_SECRET_KEY", default="another-secret", cast=str)
     ALGORITHM = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
     REFRESH_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 days
@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = "TODO list"
 
     # Database
-    SQL_CONNECTION_STRING: str = config("SQL_CONNECTION_STRING", cast=str)
+    SQL_CONNECTION_STRING: str = config("SQL_CONNECTION_STRING", default="sqlite:///database.db", cast=str)
     # MONGO_CONNECTION_STRING: str = config("MONGO_CONNECTION_STRING", cast=str)
 
     class Config:

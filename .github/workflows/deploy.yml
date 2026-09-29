@@ -1,26 +1,22 @@
-name: Build and Deploy FastAPI-React App to EC2
+name: Build and Deploy FastAPI React App to EC2 Docker
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
-permissions:
-  contents: read
-  id-token: write
-
 env:
   AWS_REGION: ap-south-1
   ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
   ECR_REPOSITORY: fastapi-react-app
-  IMAGE_TAG: latest
   INSTANCE_ID: i-03fdd22133e18bfe0
   PUBLIC_URL: http://13.202.219.162
-  SECRETS_MANAGER_ID: deptic/fastapi-react-app/secrets
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    outputs:
+      image_uri: ${{ steps.image.outputs.image_uri }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -28,106 +24,105 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Configure AWS credentials (static)
+      - name: Configure AWS credentials via env
         run: |
-          aws configure set aws_access_key_id "${{ secrets.AWS_ACCESS_KEY_ID }}"
-          aws configure set aws_secret_access_key "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
-          aws configure set region "$AWS_REGION"
-
-      - name: Build Docker image (with diagnostics)
-        run: |
-          set -o pipefail
-          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-          echo "Building image: $FULL_IMAGE"
-          docker build -f Dockerfile -t "$FULL_IMAGE" . 2>&1 | tee build.log || { echo "::error::Docker build failed, see build.log tail"; tail -n 100 build.log; exit 1; }
-          echo "Build succeeded"
-          docker images | grep "$ECR_REPOSITORY"
+          export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID}"
+          export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY}"
+          aws sts get-caller-identity
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
       - name: Login to Amazon ECR
         run: |
-          aws ecr get-login-password --region "$AWS_REGION" \
-            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
-      - name: Push image to ECR
+      - name: Compute image URI
+        id: image
         run: |
-          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-          docker push "$FULL_IMAGE"
-          echo "Pushed $FULL_IMAGE"
+          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
+          echo "image_uri=$FULL_IMAGE:${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+          echo "Image URI: $FULL_IMAGE:${GITHUB_SHA::8}"
+
+      - name: Build Docker image
+        run: |
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:${GITHUB_SHA::8}"
+          docker build -t "$IMAGE_URI" -f Dockerfile .
+          docker tag "$IMAGE_URI" "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          docker image inspect "$IMAGE_URI" --format 'Built image {{.Id}} with tags {{.RepoTags}}'
+
+      - name: Push Docker image to ECR
+        run: |
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:${GITHUB_SHA::8}"
+          docker push "$IMAGE_URI"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
 
   deploy:
     runs-on: ubuntu-latest
     needs: build-and-push
     steps:
-      - name: Configure AWS credentials (static)
+      - name: Configure AWS credentials via env
         run: |
-          aws configure set aws_access_key_id "${{ secrets.AWS_ACCESS_KEY_ID }}"
-          aws configure set aws_secret_access_key "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
-          aws configure set region "$AWS_REGION"
+          export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID}"
+          export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY}"
+          aws sts get-caller-identity
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
-      - name: Pull runtime secrets and inject into instance environment
+      - name: Deploy to EC2 via SSM
         run: |
-          echo "Fetching secrets from Secrets Manager ($SECRETS_MANAGER_ID) for use at deploy time"
-          aws secretsmanager get-secret-value --secret-id "$SECRETS_MANAGER_ID" \
-            --region "$AWS_REGION" --query SecretString --output text > /tmp/secrets.json
-          test -s /tmp/secrets.json || { echo "::error::No secrets returned"; exit 1; }
-          rm -f /tmp/secrets.json
-
-      - name: Deploy container to EC2 via SSM
-        run: |
-          set -o pipefail
           REGION="$AWS_REGION"
-          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-          INSTANCE_ID_REF="$INSTANCE_ID"
-          cat > /tmp/ssm-params.json << 'SSMPARAMS'
+          INSTANCE_ID="$INSTANCE_ID"
+          IMAGE_URI="${{ needs.build-and-push.outputs.image_uri }}"
+          ECR_REGISTRY="$ECR_REGISTRY"
+          SECRETS_ID="deptic/fastapi-react-app/secrets"
+
+          cat > /tmp/ssm-params.json << SSMPARAMS
           {
             "commands": [
               "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
               "docker pull $IMAGE_URI",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always -p 80:80 --name app $IMAGE_URI",
-              "docker ps --filter name=app --format '{{.ID}} {{.Status}}'"
+              "docker run -d --restart always -p 80:80 --name app --env-file /home/ec2-user/app.env $IMAGE_URI",
+              "sleep 15",
+              "docker ps --filter name=app --format '{{.Status}}'"
             ]
           }
           SSMPARAMS
-          COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "$INSTANCE_ID_REF" \
-            --region "$REGION" \
-            --document-name "AWS-RunShellScript" \
-            --comment "Deploy fastapi-react-app" \
-            --parameters file:///tmp/ssm-params.json \
-            --output text --query "Command.CommandId")
+
+          COMMAND_ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" --region "$REGION" --document-name "AWS-RunShellScript" --parameters file:///tmp/ssm-params.json --query "Command.CommandId" --output text)
           echo "SSM Command ID: $COMMAND_ID"
-          aws ssm wait command-executed --instance-id "$INSTANCE_ID_REF" \
-            --command-id "$COMMAND_ID" --region "$REGION" || true
-          RESULT=$(aws ssm get-command-invocation \
-            --instance-id "$INSTANCE_ID_REF" \
-            --command-id "$COMMAND_ID" --region "$REGION")
-          STATUS=$(echo "$RESULT" | jq -r .Status)
-          echo "Deployment status: $STATUS"
-          echo "--- stdout ---"; echo "$RESULT" | jq -r .StandardOutputContent
-          echo "--- stderr ---"; echo "$RESULT" | jq -r .StandardErrorContent
-          if [ "$STATUS" != "Success" ]; then
-            echo "::error::SSM deploy command failed"
-            exit 1
-          fi
+          aws ssm wait command-executed --instance-id "$INSTANCE_ID" --command-id "$COMMAND_ID" --region "$REGION"
+          aws ssm get-command-invocation --instance-id "$INSTANCE_ID" --command-id "$COMMAND_ID" --region "$REGION" --query "Status" --output text | grep -q Success
+
+      - name: Fetch secrets for verification context
+        run: |
+          aws secretsmanager get-secret-value --secret-id "deptic/fastapi-react-app/secrets" --region "$AWS_REGION" --query "SecretString" --output text > /tmp/app-secrets.json
+          echo "Secrets retrieved for deployment context"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
   verify:
     runs-on: ubuntu-latest
     needs: deploy
     steps:
-      - name: Health check (must return HTTP 200)
+      - name: Health check deployment
         run: |
-          HEALTH_URL="$PUBLIC_URL/api/v1/health"
-          echo "Checking health at $HEALTH_URL"
           for i in $(seq 1 15); do
-            CODE=$(curl -s -o /tmp/health_body -w "%{http_code}" --max-time 10 "$HEALTH_URL" || echo "000")
-            echo "Attempt $i: HTTP $CODE"
-            if [ "$CODE" = "200" ]; then
-              echo "Healthy! Response: $(cat /tmp/health_body)"
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$PUBLIC_URL/api/v1/health" || true)
+            echo "Attempt $i: HTTP $STATUS"
+            if [ "$STATUS" = "200" ]; then
+              curl -s "$PUBLIC_URL/api/v1/health"
+              echo "Deployment verified healthy."
               exit 0
             fi
             sleep 10
           done
-          echo "::error::Health check failed after 15 attempts (last status: $CODE)"
+          echo "Health check failed: did not receive HTTP 200 from $PUBLIC_URL/api/v1/health"
           exit 1

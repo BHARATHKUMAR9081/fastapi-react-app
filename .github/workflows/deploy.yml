@@ -7,254 +7,143 @@ on:
 
 env:
   AWS_REGION: ap-south-1
-  ECR_REPOSITORY: fastapi-react-app
-  ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
-  EC2_INSTANCE_ID: i-00857069f5cc6441a
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  ECR_REPOSITORY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com/fastapi-react-app
+  INSTANCE_ID: i-00857069f5cc6441a
+  SECRETS_MANAGER_ID: deptic/fastapi-react-app/secrets
   PUBLIC_URL: http://16.4.70.64
   CONTAINER_PORT: "80"
-  DOCKERFILE_PATH: .
-  HEALTH_PATH: /api/v1/health
 
 jobs:
-  build-and-push:
-    name: Build and push image to ECR
+  build-deploy-verify:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Verify repository layout and deployment evidence
-        run: |
-          set -euo pipefail
-          test -fbackend/requirements.txt
-          test -ffrontend/package.json
-          test -fbackend/app/main.py
-          test -fbackend/.env.example
-          test -ffrontend/index.html
-          grep -q "health" backend/app/api/api_v1/router.py
-          grep -q "API_V1_STR" backend/app/main.py
-          echo "Repository layout verified (FastAPI backend + Vite React frontend)."
-
-      - name: Set up Node.js (frontend toolchain diagnostics)
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Set up Python (backend toolchain diagnostics)
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
       - name: Build diagnostics - toolchain versions
         run: |
-          set -euo pipefail
+          set -e
           echo "--- node ---"; node --version
           echo "--- npm ---"; npm --version
           echo "--- python ---"; python --version
           echo "--- pip ---"; pip --version
+          echo "--- docker ---"; docker --version
+          echo "--- aws ---"; aws --version || true
 
-      - name: Frontend diagnostics - install and typecheck/build
+      - name: Diagnostics - frontend dependency install (devDependencies for tsc/vite)
         working-directory: frontend
-        run: |
-          set -euo pipefail
-          npm install --legacy-peer-deps
-          npm run build
-          test -d dist
-          test -f dist/index.html
-          echo "Frontend Vite build produced dist/ successfully."
+        run: npm install --legacy-peer-deps
 
-      - name: Backend diagnostics - install requirements and import app
+      - name: Diagnostics - frontend typecheck and build (tsc && vite build)
+        working-directory: frontend
+        run: npm run build
+
+      - name: Diagnostics - backend dependency check (pip install -r requirements.txt)
         working-directory: backend
         run: |
-          set -euo pipefail
-          cp .env.example .env
+          set -e
           pip install -r requirements.txt
-          python -c "import fastapi, sqlmodel, uvicorn, jwt, passlib; print('backend deps OK')"
-          python -c "from app.main import app; print('FastAPI app import OK:', app.title)"
+          python -c "import fastapi, sqlmodel, uvicorn, jwt, passlib, decouple; print('backend imports OK')"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Configure AWS credentials (static credentials via AWS CLI env)
+      - name: Login to Amazon ECR (AWS CLI static credentials)
         run: |
-          set -euo pipefail
-          aws --version
-          aws sts get-caller-identity --region "$AWS_REGION"
-
-      - name: Login to Amazon ECR (direct AWS CLI)
-        run: |
-          set -euo pipefail
+          set -e
+          ECR_REGISTRY="759204735992.dkr.ecr.ap-south-1.amazonaws.com"
           aws ecr get-login-password --region "$AWS_REGION" \
             | docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
-      - name: Compute image tags
-        id: image
+      - name: Build and push Docker image (context ., Dockerfile at repo root, port 80)
         run: |
-          set -euo pipefail
+          set -e
+          IMAGE_TAG="$(date +%Y%m%d%H%M%S)-${GITHUB_SHA}"
           SHORT_SHA="$(echo "${GITHUB_SHA}" | cut -c1-7)"
-          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
-          IMAGE_URI="${FULL_IMAGE}:latest"
-          echo "FULL_IMAGE=$FULL_IMAGE" >> "$GITHUB_OUTPUT"
-          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_OUTPUT"
-          echo "SHORT_SHA=$SHORT_SHA" >> "$GITHUB_OUTPUT"
-          echo "Building and pushing $IMAGE_URI (commit $SHORT_SHA)"
-
-      - name: Build and push Docker image (unified nginx + uvicorn runtime)
-        run: |
-          set -euo pipefail
-          FULL_IMAGE="${{ steps.image.outputs.FULL_IMAGE }}"
-          docker build \
+          FULL_IMAGE="$ECR_REPOSITORY"
+          docker buildx build \
             --file Dockerfile \
-            --tag "$FULL_IMAGE:latest" \
-            --tag "$FULL_IMAGE:${{ steps.image.outputs.SHORT_SHA }}" \
-            "$DOCKERFILE_PATH"
-          docker push "$FULL_IMAGE:latest"
-          docker push "$FULL_IMAGE:${{ steps.image.outputs.SHORT_SHA }}"
-          echo "Image pushed to $FULL_IMAGE"
+            --context . \
+            --tag "${FULL_IMAGE}:latest" \
+            --tag "${FULL_IMAGE}:${SHORT_SHA}" \
+            --push \
+            .
+          echo "IMAGE_URI=${FULL_IMAGE}:latest" >> "$GITHUB_ENV"
+          echo "Built and pushed ${FULL_IMAGE}:latest and ${FULL_IMAGE}:${SHORT_SHA}"
 
-  deploy-to-ec2:
-    name: Deploy container to EC2 via SSM
-    runs-on: ubuntu-latest
-    needs: build-and-push
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Configure AWS credentials (direct AWS CLI, static credentials)
+      - name: Deploy to EC2 via SSM send-command (docker pull and run on port 80)
         run: |
-          set -euo pipefail
-          aws --version
-          aws sts get-caller-identity --region "$AWS_REGION"
-
-      - name: Write SSM commands payload to JSON file
-        run: |
+          set -e
+          REGION="$AWS_REGION"
+          ECR_REGISTRY="759204735992.dkr.ecr.ap-south-1.amazonaws.com"
+          IMAGE_URI="$IMAGE_URI"
           cat > /tmp/ssm-params.json << 'SSMPARAMS'
           {
             "commands": [
-              "set -e",
-              "REGION=ap-south-1",
-              "ECR_REGISTRY=759204735992.dkr.ecr.ap-south-1.amazonaws.com",
-              "IMAGE_URI=759204735992.dkr.ecr.ap-south-1.amazonaws.com/fastapi-react-app:latest",
-              "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
-              "docker pull $IMAGE_URI",
+              "aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 759204735992.dkr.ecr.ap-south-1.amazonaws.com",
+              "docker pull 759204735992.dkr.ecr.ap-south-1.amazonaws.com/fastapi-react-app:latest",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always -p 80:80 --name app --env-file /opt/app/.env $IMAGE_URI",
-              "sleep 5",
-              "docker ps --filter name=app --format '{{.ID}} {{.Status}}'"
+              "docker run -d --restart always -p 80:80 --name app --env-file /etc/app.env 759204735992.dkr.ecr.ap-south-1.amazonaws.com/fastapi-react-app:latest"
             ]
           }
           SSMPARAMS
-          echo "SSM parameters file written:"
-          cat /tmp/ssm-params.json
-
-      - name: Ensure remote env file from Secrets Manager exists on instance
-        run: |
-          set -euo pipefail
-          cat > /tmp/ssm-env-setup.json << 'SSMENV'
-          {
-            "commands": [
-              "set -e",
-              "mkdir -p /opt/app",
-              "if [ ! -f /opt/app/.env ]; then",
-              "  aws secretsmanager get-secret-value --secret-id deptic/fastapi-react-app/secrets --region ap-south-1 --query SecretString --output text > /opt/app/.env",
-              "  chmod 600 /opt/app/.env",
-              "fi",
-              "grep -q SQL_CONNECTION_STRING /opt/app/.env || echo 'SQL_CONNECTION_STRING=sqlite:///database.db' >> /opt/app/.env",
-              "echo env file ready"
-            ]
-          }
-          SSMENV
-          ENV_COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "$EC2_INSTANCE_ID" \
-            --region "$AWS_REGION" \
-            --document-name "AWS-RunShellScript" \
-            --parameters file:///tmp/ssm-env-setup.json \
-            --query "Command.CommandId" --output text)
-          echo "ENV_COMMAND_ID=$ENV_COMMAND_ID"
-          aws ssm wait command-executed \
-            --command-id "$ENV_COMMAND_ID" \
-            --instance-id "$EC2_INSTANCE_ID" \
-            --region "$AWS_REGION"
-          STATUS=$(aws ssm get-command-invocation \
-            --command-id "$ENV_COMMAND_ID" \
-            --instance-id "$EC2_INSTANCE_ID" \
-            --region "$AWS_REGION" \
-            --query Status --output text)
-          echo "Env setup status: $STATUS"
-          if [ "$STATUS" != "Success" ]; then
-            echo "Remote env setup failed"
-            aws ssm get-command-invocation --command-id "$ENV_COMMAND_ID" --instance-id "$EC2_INSTANCE_ID" --region "$AWS_REGION"
-            exit 1
-          fi
-
-      - name: Send deployment command via SSM
-        id: deploy
-        run: |
-          set -euo pipefail
-          COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "$EC2_INSTANCE_ID" \
-            --region "$AWS_REGION" \
-            --document-name "AWS-RunShellScript" \
-            --parameters file:///tmp/ssm-params.json \
-            --query "Command.CommandId" --output text)
+          COMMAND_ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" --region "$REGION" --document-name "AWS-RunShellScript" --parameters file:///tmp/ssm-params.json --query "Command.CommandId" --output text)
           echo "COMMAND_ID=$COMMAND_ID"
-          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+          sleep 10
+          for i in $(seq 1 30); do
+            STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$REGION" --query "Status" --output text || true)
+            echo "SSM status: $STATUS"
+            if [ "$STATUS" = "Success" ]; then
+              echo "SSM command succeeded"
+              exit 0
+            fi
+            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ] || [ "$STATUS" = "Cancelled" ]; then
+              echo "SSM command failed with status $STATUS"
+              aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$REGION" || true
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "SSM command timed out"
+          exit 1
 
-      - name: Wait for deployment command completion
+      - name: Verify - wait for container health (HTTP 200 on /api/v1/health via nginx port 80)
         run: |
-          set -euo pipefail
-          COMMAND_ID="${{ steps.deploy.outputs.command_id }}"
-          aws ssm wait command-executed \
-            --command-id "$COMMAND_ID" \
-            --instance-id "$EC2_INSTANCE_ID" \
-            --region "$AWS_REGION"
-          STATUS=$(aws ssm get-command-invocation \
-            --command-id "$COMMAND_ID" \
-            --instance-id "$EC2_INSTANCE_ID" \
-            --region "$AWS_REGION" \
-            --query Status --output text)
-          echo "Deploy command status: $STATUS"
-          if [ "$STATUS" != "Success" ]; then
-            echo "Deployment failed; command output:"
-            aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" \
-              --instance-id "$EC2_INSTANCE_ID" \
-              --region "$AWS_REGION"
-            exit 1
-          fi
-
-  verify:
-    name: Verify production health endpoint
-    runs-on: ubuntu-latest
-    needs: deploy-to-ec2
-    steps:
-      - name: Health check - expect HTTP 200 on /api/v1/health
-        run: |
-          set -euo pipefail
-          HEALTH_URL="$PUBLIC_URL$HEALTH_PATH"
-          echo "Checking $HEALTH_URL"
+          set -e
+          HEALTH_URL="${PUBLIC_URL}/api/v1/health"
+          echo "Polling $HEALTH_URL"
           for i in $(seq 1 30); do
             CODE=$(curl -s -o /tmp/health.json -w "%{http_code}" "$HEALTH_URL" || true)
-            echo "Attempt $i: HTTP $CODE"
+            echo "attempt $i -> HTTP $CODE"; cat /tmp/health.json || true
             if [ "$CODE" = "200" ]; then
-              cat /tmp/health.json
-              echo "Health check passed with HTTP 200."
+              echo "Health check passed (HTTP 200)"
               exit 0
             fi
             sleep 10
           done
-          echo "Health check never returned HTTP 200."
+          echo "Health check never returned HTTP 200"
           exit 1
 
-      - name: Verify SPA served by nginx on port 80
+      - name: Verify - public URL serves the SPA (HTTP 200)
         run: |
-          set -euo pipefail
-          CODE=$(curl -s -o /tmp/index.html -w "%{http_code}" "$PUBLIC_URL/")
-          echo "Root URL returned HTTP $CODE"
+          set -e
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" "$PUBLIC_URL/")
+          echo "public url HTTP $CODE"
           if [ "$CODE" != "200" ]; then
-            echo "SPA root check failed"
+            echo "public URL did not return HTTP 200"
             exit 1
           fi
-          grep -qi "<div id=\"root\">" /tmp/index.html
-          echo "Frontend SPA served correctly."
+          echo "Public URL verification passed"

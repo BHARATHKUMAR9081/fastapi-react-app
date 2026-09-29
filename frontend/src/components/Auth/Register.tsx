@@ -25,6 +25,7 @@ import axios from 'axios'
 import { ThemeToggler } from '../Theme/ThemeToggler'
 
 export type RegisterUserProps = {
+  id?: string | number
   username: string
   email: string
   password: string

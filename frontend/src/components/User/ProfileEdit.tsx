@@ -22,6 +22,7 @@ import { ViewIcon, ViewOffIcon } from '@chakra-ui/icons'
 import axiosInstance from '../../services/axios'
 import { useForm } from 'react-hook-form'
 import { RegisterUserProps } from '../Auth/Register'
+import { LoginUserType } from '../Auth/UserType.types'
 
 export type UserProfileEditType = {
   defaultValues?: RegisterUserProps
@@ -56,12 +57,13 @@ export const UserProfileEdit = ({
       })
       onSuccess()
       onClose()
-    } catch (err) {
+    } catch (err: any) {
       console.error(err)
-      const msg = err.response.data.detail[0].msg
-      console.log(err.response.data.detail)
+      const detail = err?.response?.data?.detail
+      const msg = Array.isArray(detail) ? detail[0]?.msg : detail || 'An error occurred'
+      console.log(detail)
       toast({
-        title: msg,
+        title: typeof msg === 'string' ? msg : JSON.stringify(msg),
         status: 'error',
         isClosable: true,
         duration: 1500,

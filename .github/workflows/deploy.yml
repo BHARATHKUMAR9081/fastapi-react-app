@@ -1,4 +1,4 @@
-name: Build, Deploy and Verify (EC2 Docker)
+name: build-deploy-verify
 
 on:
   push:
@@ -7,232 +7,180 @@ on:
 
 env:
   AWS_REGION: ap-south-1
-  ECR_REPOSITORY_URI: 759204735992.dkr.ecr.ap-south-1.amazonaws.com/fastapi-react-app
-  EC2_INSTANCE_ID: i-00857069f5cc6441a
-  PUBLIC_URL: http://16.4.70.64
-  CONTAINER_PORT: "80"
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  ECR_REPOSITORY_URI: 759204735992.dkr.ecr.ap-south-1.amazonaws.com/fastapi-react-app
+  EC2_INSTANCE_ID: i-00857069f5cc6441a
+  SECRETS_MANAGER_ID: deptic/fastapi-react-app/secrets
+  CONTAINER_PORT: "80"
+  PUBLIC_URL: http://16.4.70.64
 
 jobs:
-  build-and-push:
-    name: Build diagnostics and push image to ECR
+  build-push-deploy-verify:
     runs-on: ubuntu-latest
-    outputs:
-      image_tag: ${{ steps.meta.outputs.image_tag }}
-      image_uri: ${{ steps.meta.outputs.image_uri }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js (frontend toolchain diagnostics)
+      - name: Setup Node.js (frontend toolchain for diagnostics)
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Setup Python (backend toolchain diagnostics)
+      - name: Setup Python (backend toolchain for diagnostics)
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
-      - name: Build diagnostics - repository layout
+      - name: Backend build diagnostics
+        working-directory: backend
         run: |
-          set -euo pipefail
-          echo "--- repository tree (top levels) ---"
-          ls -la
-          echo "--- backend ---"
-          ls -la backend
-          echo "--- frontend ---"
-          ls -la frontend
-
-      - name: Build diagnostics - backend (FastAPI / SQLModel, Python 3.10)
-        run: |
-          set -euo pipefail
+          set -e
           python --version
-          python -m pip --version
-          echo "--- backend/requirements.txt (pinned deps) ---"
-          head -n 20 backend/requirements.txt
-          python -m pip install --no-cache-dir -r backend/requirements.txt
-          python - <<'PYEOF'
-          import fastapi, sqlmodel, pydantic, uvicorn, jwt, passlib
-          print("fastapi", fastapi.__version__)
-          print("sqlmodel", sqlmodel.__version__)
-          print("pydantic", pydantic.VERSION)
-          print("uvicorn", uvicorn.__version__)
-          PYEOF
-          (cd backend && python -c "from app.main import app; print('FastAPI app import OK:', app.title)")
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -c "import fastapi, sqlmodel, uvicorn, jwt, passlib; print('fastapi', fastapi.__version__)"
+          python -m compileall -q app
+          python -c "from app.main import app; print('FastAPI app import OK:', app.title)"
 
-      - name: Build diagnostics - frontend (Vite + React + TypeScript)
+      - name: Frontend build diagnostics
+        working-directory: frontend
         run: |
-          set -euo pipefail
+          set -e
           node --version
           npm --version
-          cd frontend
           npm install --legacy-peer-deps
           npm run build
-          test -f dist/index.html && echo "Vite build produced dist/index.html"
+          test -f dist/index.html && echo "Vite dist bundle OK"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Compute image tag and URI
-        id: meta
+      - name: Compute image tag and authenticate to ECR (AWS CLI)
+        id: image
         run: |
-          set -euo pipefail
+          set -e
           ECR_REGISTRY="${ECR_REPOSITORY_URI%%/*}"
-          SHORT_SHA="$(git rev-parse --short HEAD)"
-          IMAGE_TAG="${GITHUB_RUN_ID}-${SHORT_SHA}"
-          IMAGE_URI="${ECR_REPOSITORY_URI}:${IMAGE_TAG}"
-          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
-          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
-          echo "ECR registry: ${ECR_REGISTRY}"
-          echo "Image URI:    ${IMAGE_URI}"
+          IMAGE_TAG="$(git rev-parse --short HEAD)-$(date -u +%Y%m%d%H%M%S)"
+          FULL_IMAGE="$ECR_REPOSITORY_URI:$IMAGE_TAG"
+          LATEST_IMAGE="$ECR_REPOSITORY_URI:latest"
+          {
+            echo "registry=$ECR_REGISTRY"
+            echo "tag=$IMAGE_TAG"
+            echo "full_image=$FULL_IMAGE"
+            echo "latest_image=$LATEST_IMAGE"
+          } >> "$GITHUB_OUTPUT"
+          echo "Registry: $ECR_REGISTRY"
+          echo "Image: $FULL_IMAGE"
+          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
-      - name: AWS CLI - authenticate with static credentials
+      - name: Build Docker image (repo-root context, Dockerfile at .)
         run: |
-          set -euo pipefail
-          aws sts get-caller-identity
-
-      - name: AWS CLI - login to ECR
-        run: |
-          set -euo pipefail
-          ECR_REGISTRY="${ECR_REPOSITORY_URI%%/*}"
-          aws ecr get-login-password --region "$AWS_REGION" \
-            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
-
-      - name: Build unified Docker image (nginx + uvicorn, port 80) and push to ECR
-        run: |
-          set -euo pipefail
-          IMAGE_URI="${{ steps.meta.outputs.image_uri }}"
+          set -e
           docker build \
-            --file Dockerfile \
-            --tag "${ECR_REPOSITORY_URI}:latest" \
-            --tag "${IMAGE_URI}" \
+            -t "${{ steps.image.outputs.full_image }}" \
+            -t "${{ steps.image.outputs.latest_image }}" \
+            -f Dockerfile \
             .
-          docker push "${ECR_REPOSITORY_URI}:latest"
-          docker push "${IMAGE_URI}"
+          docker image inspect "${{ steps.image.outputs.full_image }}" --format 'Image {{.Id}} size {{.Size}}'
 
-      - name: Build diagnostics - image inspection
+      - name: Smoke-test container locally on port 80
         run: |
-          set -euo pipefail
-          IMAGE_URI="${{ steps.meta.outputs.image_uri }}"
-          docker images --no-trunc | head -n 20
-          docker inspect "${IMAGE_URI}" --format 'ExposedPorts: {{json .Config.ExposedPorts}}'
+          set -e
+          docker run -d --name smoke \
+            -p 80:80 \
+            -e JWT_SECRET_KEY=ci-secret \
+            -e JWT_REFRESH_SECRET_KEY=ci-refresh-secret \
+            -e SQL_CONNECTION_STRING=sqlite:///database.db \
+            "${{ steps.image.outputs.full_image }}"
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:80/api/v1/health >/dev/null 2>&1; then
+              echo "Container health endpoint responded"
+              break
+            fi
+            sleep 2
+          done
+          BODY=$(curl -fsS http://127.0.0.1:80/api/v1/health)
+          echo "Health body: $BODY"
+          echo "$BODY" | grep -q "OK"
+          curl -fsS http://127.0.0.1:80/ | grep -qi "<div id=\"root\">" && echo "SPA served on port 80"
+          docker logs smoke
+          docker rm -f smoke
 
-  deploy-to-ec2:
-    name: Deploy container to EC2 via SSM
-    runs-on: ubuntu-latest
-    needs: build-and-push
-    steps:
-      - name: AWS CLI - authenticate with static credentials
+      - name: Push image to Amazon ECR
         run: |
-          set -euo pipefail
-          aws sts get-caller-identity
+          set -e
+          docker push "${{ steps.image.outputs.full_image }}"
+          docker push "${{ steps.image.outputs.latest_image }}"
+          aws ecr describe-images \
+            --repository-name fastapi-react-app \
+            --region "$AWS_REGION" \
+            --image-ids imageTag="${{ steps.image.outputs.tag }}" \
+            --query 'imageDetails[0].[imageTags[0],imageSizeInBytes]' --output text
 
-      - name: Deploy image on EC2 instance via SSM RunShellScript
+      - name: Deploy to EC2 via SSM send-command (docker pull/run on port 80)
         run: |
-          set -euo pipefail
-          ECR_REGISTRY="${ECR_REPOSITORY_URI%%/*}"
-          IMAGE_URI="${{ needs.build-and-push.outputs.image_uri }}"
-
-          cat > /tmp/ssm-params.json << SSMPARAMS
+          set -e
+          IMAGE_URI="${{ steps.image.outputs.full_image }}"
+          ECR_REGISTRY="${{ steps.image.outputs.registry }}"
+          cat > /tmp/ssm-params.json << 'SSMPARAMS'
           {
             "commands": [
               "set -e",
-              "export REGION=${AWS_REGION}",
-              "export ECR_REGISTRY=${ECR_REGISTRY}",
-              "export IMAGE_URI=${IMAGE_URI}",
-              "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
-              "docker pull $IMAGE_URI",
+              "export AWS_DEFAULT_REGION=ap-south-1",
+              "aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 759204735992.dkr.ecr.ap-south-1.amazonaws.com",
+              "docker pull IMAGE_URI_PLACEHOLDER",
               "docker stop app || true",
               "docker rm app || true",
-              "aws s3 cp s3://deptic-fastapi-react-artifacts/env/.env /tmp/app.env || aws secretsmanager get-secret-value --region ${AWS_REGION} --secret-id deptic/fastapi-react-app/secrets --query SecretString --output text > /tmp/app.env || true",
-              "docker run -d --restart always -p 80:80 --name app --env-file /tmp/app.env -e SQL_CONNECTION_STRING=sqlite:///database.db $IMAGE_URI"
+              "SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id deptic/fastapi-react-app/secrets --region ap-south-1 --query SecretString --output text)",
+              "JWT_SECRET_KEY=$(echo \"$SECRET_JSON\" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get(\"JWT_SECRET_KEY\", d.get(\"jwt_secret_key\", \"\")))')",
+              "JWT_REFRESH_SECRET_KEY=$(echo \"$SECRET_JSON\" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get(\"JWT_REFRESH_SECRET_KEY\", d.get(\"jwt_refresh_secret_key\", \"\")))')",
+              "SQL_CONNECTION_STRING=$(echo \"$SECRET_JSON\" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get(\"SQL_CONNECTION_STRING\", d.get(\"sql_connection_string\", \"sqlite:///database.db\")))')",
+              "docker run -d --restart always -p 80:80 --name app -e JWT_SECRET_KEY=\"$JWT_SECRET_KEY\" -e JWT_REFRESH_SECRET_KEY=\"$JWT_REFRESH_SECRET_KEY\" -e SQL_CONNECTION_STRING=\"$SQL_CONNECTION_STRING\" IMAGE_URI_PLACEHOLDER",
+              "docker ps --filter name=app --format 'table {{.Names}}\\t{{.Status}}\\t{{.Ports}}'"
             ]
           }
           SSMPARAMS
+          sed -i "s|IMAGE_URI_PLACEHOLDER|$IMAGE_URI|g" /tmp/ssm-params.json
+          cat /tmp/ssm-params.json
+          COMMAND_ID=$(aws ssm send-command --instance-ids "$EC2_INSTANCE_ID" --region "$AWS_REGION" --document-name "AWS-RunShellScript" --parameters file:///tmp/ssm-params.json --query "Command.CommandId" --output text)
+          echo "CommandId: $COMMAND_ID"
+          aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "$EC2_INSTANCE_ID" --region "$AWS_REGION"
+          STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$EC2_INSTANCE_ID" --region "$AWS_REGION" --query "Status" --output text)
+          echo "SSM command status: $STATUS"
+          if [ "$STATUS" != "Success" ]; then
+            echo "SSM command failed; stdout/stderr below"
+            aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$EC2_INSTANCE_ID" --region "$AWS_REGION" --query "StandardOutputContent" --output text
+            aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$EC2_INSTANCE_ID" --region "$AWS_REGION" --query "StandardErrorContent" --output text
+            exit 1
+          fi
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$EC2_INSTANCE_ID" --region "$AWS_REGION" --query "StandardOutputContent" --output text
 
-          COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "$EC2_INSTANCE_ID" \
-            --region "$AWS_REGION" \
-            --document-name "AWS-RunShellScript" \
-            --parameters file:///tmp/ssm-params.json \
-            --query "Command.CommandId" --output text)
-          echo "SSM command id: ${COMMAND_ID}"
-
-          STATUS=""
-          for _ in $(seq 1 60); do
-            STATUS=$(aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" \
-              --instance-id "$EC2_INSTANCE_ID" \
-              --region "$AWS_REGION" \
-              --query "Status" --output text 2>/dev/null || echo "Pending")
-            echo "SSM status: ${STATUS}"
-            case "$STATUS" in
-              Success) break ;;
-              InProgress|Pending|Delayed) sleep 5 ;;
-              *) echo "SSM command failed with status ${STATUS}" ; exit 1 ;;
-            esac
-          done
-          [ "$STATUS" = "Success" ] || { echo "SSM command did not succeed in time"; exit 1; }
-
-          echo "--- SSM stdout ---"
-          aws ssm get-command-invocation \
-            --command-id "$COMMAND_ID" \
-            --instance-id "$EC2_INSTANCE_ID" \
-            --region "$AWS_REGION" \
-            --query "StandardOutputContent" --output text
-          echo "--- SSM stderr ---"
-          aws ssm get-command-invocation \
-            --command-id "$COMMAND_ID" \
-            --instance-id "$EC2_INSTANCE_ID" \
-            --region "$AWS_REGION" \
-            --query "StandardErrorContent" --output text || true
-
-  verify-deployment:
-    name: Verify public endpoint health
-    runs-on: ubuntu-latest
-    needs: deploy-to-ec2
-    steps:
-      - name: Wait for container startup (nginx + uvicorn boot)
-        run: sleep 20
-
-      - name: Health check - API via nginx proxy (HTTP 200 required)
+      - name: Verify production health endpoint returns HTTP 200
         run: |
-          set -euo pipefail
-          HEALTH_URL="${PUBLIC_URL}/api/v1/health"
-          echo "Checking ${HEALTH_URL}"
-          for i in $(seq 1 30); do
-            CODE=$(curl -s -o /tmp/health.json -w '%{http_code}' "$HEALTH_URL" || true)
-            echo "attempt ${i}: HTTP ${CODE}"
+          set -e
+          HEALTH_URL="$PUBLIC_URL/api/v1/health"
+          echo "Waiting for $HEALTH_URL ..."
+          OK=0
+          for i in $(seq 1 45); do
+            CODE=$(curl -s -o /tmp/health-body -w '%{http_code}' "$HEALTH_URL" || true)
+            echo "Attempt $i: HTTP $CODE"
             if [ "$CODE" = "200" ]; then
-              cat /tmp/health.json
-              echo "Health check passed with HTTP 200"
-              exit 0
+              OK=1
+              break
             fi
             sleep 5
           done
-          echo "Health check failed; last HTTP code: ${CODE}"
-          exit 1
-
-      - name: Health check - frontend served on port 80 (HTTP 200 required)
-        run: |
-          set -euo pipefail
-          CODE=$(curl -s -o /tmp/index.html -w '%{http_code}' "${PUBLIC_URL}/")
-          echo "HTTP ${CODE} for ${PUBLIC_URL}/"
-          [ "$CODE" = "200" ] || exit 1
-          grep -qi '<div id="root">' /tmp/index.html && echo "SPA index.html served correctly"
-
-      - name: Deployment summary
-        run: |
-          {
-            echo "## Deployment Summary"
-            echo "| Key | Value |"
-            echo "| --- | --- |"
-            echo "| Public URL | ${PUBLIC_URL} |"
-            echo "| Public IP | 16.4.70.64 |"
-            echo "| EC2 instance | ${EC2_INSTANCE_ID} |"
-            echo "| ECR repository | ${ECR_REPOSITORY_URI} |"
-            echo "| Container port | ${CONTAINER_PORT} |"
-            echo "| Health endpoint | ${PUBLIC_URL}/api/v1/health |"
-          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$OK" != "1" ]; then
+            echo "Health check never returned HTTP 200"
+            exit 1
+          fi
+          cat /tmp/health-body
+          echo ""
+          CODE_ROOT=$(curl -s -o /dev/null -w '%{http_code}' "$PUBLIC_URL/")
+          echo "Root URL HTTP status: $CODE_ROOT"
+          if [ "$CODE_ROOT" != "200" ]; then
+            echo "Root URL did not return HTTP 200"
+            exit 1
+          fi
+          echo "Production deployment verified at $PUBLIC_URL"

@@ -13,108 +13,100 @@ env:
   PUBLIC_URL: http://13.202.219.162
 
 jobs:
-  build-and-push:
+  build-and-deploy:
     runs-on: ubuntu-latest
-    outputs:
-      image_uri: ${{ steps.image.outputs.image_uri }}
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Configure AWS credentials (env)
+      - name: Configure AWS credentials (static)
         run: |
-          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> "$GITHUB_ENV"
-          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> "$GITHUB_ENV"
+          export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
+          export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          echo "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" >> "$GITHUB_ENV"
+          echo "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" >> "$GITHUB_ENV"
 
-      - name: Verify AWS identity
-        run: aws sts get-caller-identity --region "$AWS_REGION"
-
-      - name: Compute image tag
-        id: image
+      - name: Build diagnostics
         run: |
-          SHORT_SHA="${GITHUB_SHA::7}"
-          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$SHORT_SHA"
-          echo "image_uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
-          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
-          echo "Built image URI: $IMAGE_URI"
+          echo "Target service: EC2_DOCKER"
+          echo "Region: $AWS_REGION"
+          echo "ECR repository: $ECR_REGISTRY/$ECR_REPOSITORY"
+          echo "EC2 instance: $INSTANCE_ID"
+          echo "Container port: 8000 (uvicorn behind nginx:80)"
+          docker version
+          ls -la
+          test -f Dockerfile || { echo "Dockerfile missing"; exit 1; }
 
-      - name: Login to Amazon ECR
+      - name: Build Docker image
         run: |
+          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
+          docker build -t "$FULL_IMAGE:${{ github.sha }}" -t "$FULL_IMAGE:latest" -f Dockerfile .
+
+      - name: Smoke test container locally
+        run: |
+          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
+          docker run -d --name smoke -p 8080:80 "$FULL_IMAGE:latest"
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/api/v1/health; then
+              echo "Smoke test passed"; docker rm -f smoke; exit 0
+            fi
+            sleep 2
+          done
+          echo "Smoke test failed"; docker logs smoke; docker rm -f smoke; exit 1
+
+      - name: Push image to ECR
+        run: |
+          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
           aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+          docker push "$FULL_IMAGE:${{ github.sha }}"
+          docker push "$FULL_IMAGE:latest"
 
-      - name: Build image
+      - name: Deploy to EC2 via SSM
         run: |
-          docker build -f Dockerfile -t "$IMAGE_URI" -t "$ECR_REGISTRY/$ECR_REPOSITORY:latest" .
-          docker image inspect "$IMAGE_URI" --format 'Built {{.Id}} size={{.Size}}'
-
-      - name: Push image
-        run: |
-          docker push "$IMAGE_URI"
-          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
-          docker image inspect "$IMAGE_URI" > /dev/null && echo "Push verified"
-
-  deploy:
-    runs-on: ubuntu-latest
-    needs: build-and-push
-    steps:
-      - name: Configure AWS credentials (env)
-        run: |
-          echo "AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}" >> "$GITHUB_ENV"
-          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> "$GITHUB_ENV"
-
-      - name: Deploy via SSM to EC2
-        run: |
-          IMAGE_URI="${{ needs.build-and-push.outputs.image_uri }}"
-          REGION="$AWS_REGION"
-          ECR_REGISTRY="$ECR_REGISTRY"
-          INSTANCE_ID="$INSTANCE_ID"
-          cat > /tmp/ssm-params.json << 'SSMPARAMS'
+          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
+          cat > /tmp/ssm-params.json << SSMPARAMS
           {
             "commands": [
-              "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
-              "docker pull $IMAGE_URI",
+              "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
+              "docker pull $FULL_IMAGE:latest",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always -p 80:80 --name app -e JWT_SECRET_KEY=$JWT_SECRET -e JWT_REFRESH_SECRET_KEY=$JWT_REFRESH_SECRET -e SQL_CONNECTION_STRING=sqlite:////usr/src/app/backend/database.db $IMAGE_URI",
-              "sleep 15",
-              "docker ps --filter name=app --format '{{.Status}}'"
+              "docker run -d --restart always -p 80:80 --name app $FULL_IMAGE:latest"
             ]
           }
           SSMPARAMS
-          # Inject runtime values into the params file (SSM has no access to GH secrets)
-          sed -i "s|\$IMAGE_URI|$IMAGE_URI|g; s|\$REGION|$REGION|g; s|\$ECR_REGISTRY|$ECR_REGISTRY|g; s|\$JWT_SECRET|${{ secrets.JWT_SECRET_KEY }}|g; s|\$JWT_REFRESH_SECRET|${{ secrets.JWT_REFRESH_SECRET_KEY }}|g" /tmp/ssm-params.json
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
-            --region "$REGION" \
+            --region "$AWS_REGION" \
             --document-name "AWS-RunShellScript" \
-            --comment "Deploy $IMAGE_URI" \
             --parameters file:///tmp/ssm-params.json \
             --query "Command.CommandId" --output text)
           echo "SSM command: $COMMAND_ID"
           for i in $(seq 1 30); do
-            STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$REGION" --query Status --output text)
-            echo "Attempt $i status: $STATUS"
-            [ "$STATUS" = "Success" ] && exit 0
-            [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ] && aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$REGION" --output json && exit 1
-            sleep 10
+            STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION" --query Status --output text)
+            echo "SSM status: $STATUS"
+            case "$STATUS" in
+              Success) exit 0 ;;
+              Failed|Cancelled|TimedOut)
+                aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION"
+                exit 1 ;;
+            esac
+            sleep 5
           done
-          echo "SSM command timed out"
-          exit 1
+          echo "SSM command timed out"; exit 1
 
-  verify:
-    runs-on: ubuntu-latest
-    needs: deploy
-    steps:
-      - name: Health check
+      - name: Health check (HTTP 200 required)
         run: |
-          for i in $(seq 1 20); do
-            CODE=$(curl -s -o /tmp/health.out -w "%{http_code}" --max-time 10 "$PUBLIC_URL/api/v1/health" || echo "000")
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$PUBLIC_URL/api/v1/health" || echo "000")
             echo "Attempt $i: HTTP $CODE"
-            [ "$CODE" = "200" ] && cat /tmp/health.out && exit 0
-            sleep 10
+            if [ "$CODE" = "200" ]; then
+              echo "Deployment verified healthy at $PUBLIC_URL"
+              exit 0
+            fi
+            sleep 5
           done
-          echo "Health check failed at $PUBLIC_URL"
-          exit 1
+          echo "Health check failed at $PUBLIC_URL"; exit 1
